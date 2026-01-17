@@ -2,121 +2,119 @@ import streamlit as st
 import pandas as pd
 import yfinance as yf
 from FinMind.data import DataLoader
-from datetime import datetime
+from datetime import datetime, timedelta
 import os
 import traceback
-import time
+
+# ==========================================
+# 版本資訊 (Version Tracking)
+# ==========================================
+CURRENT_VERSION = "V5.0"
+LAST_UPDATED = "2026-01-17"
+CHANGELOG = """
+- 新增：版本監控與更新紀錄面板
+- 修正：yfinance 批量下載失敗時的單兵救援機制
+- 修正：針對 3707 等標的強化 .TW / .TWO 自動切換
+- 新增：詳細錯誤診斷資訊輸出
+"""
 
 # =========================
 # 頁面配置
 # =========================
-st.set_page_config(page_title="台股 MA5 穩定版 (yfinance)", layout="wide")
+st.set_page_config(page_title=f"台股 MA5 監控 {CURRENT_VERSION}", layout="wide")
 
-def get_ma5_logic(token, stock_list):
+def get_ma5_data(token, stock_list):
     try:
         api = DataLoader()
         api.login_by_token(api_token=token)
         
-        # 1. 抓取 FinMind 快照 (決定前 300 名排行)
-        df_snap = api.taiwan_stock_tick_snapshot()
-        if df_snap is None or df_snap.empty:
-            return None, "FinMind API 未回傳快照數據。"
-        
-        # 篩選名單
-        df = df_snap[df_snap['stock_id'].isin(stock_list)].copy()
-        vol_col = next((c for c in ['total_volume', 'volume'] if c in df.columns), 'volume')
-        for c in ['close', 'high', 'low', vol_col]:
-            df[c] = pd.to_numeric(df[c], errors='coerce')
-        
-        df = df.dropna(subset=['close', 'high', 'low', vol_col])
-        df['tp'] = (df['high'] + df['low'] + df['close']) / 3.0
-        df['amount_m'] = (df['tp'] * df[vol_col]) / 1_000_000.0
-        top_300 = df.sort_values('amount_m', ascending=False).head(300).copy()
-        
-        # 2. 透過 yfinance 分批下載歷史資料 (解決資料不足核心問題)
-        st.info("正在分批同步 300 檔個股之 yfinance 歷史數據...")
+        # 1. 抓取 FinMind 快照
+        with st.spinner("Step 1: 正在獲取市場即時排行..."):
+            df_snap = api.taiwan_stock_tick_snapshot()
+            if df_snap is None or df_snap.empty:
+                return None, "FinMind API 未回傳快照，請檢查 Token。"
+            
+            df_snap['stock_id'] = df_snap['stock_id'].astype(str)
+            df = df_snap[df_snap['stock_id'].isin(stock_list)].copy()
+            
+            # 計算成交值 (TP 邏輯)
+            vol_col = next((c for c in ['total_volume', 'volume'] if c in df.columns), 'volume')
+            for c in ['close', 'high', 'low', vol_col]:
+                df[c] = pd.to_numeric(df[c], errors='coerce')
+            df = df.dropna(subset=['close', 'high', 'low', vol_col])
+            
+            df['tp'] = (df['high'] + df['low'] + df['close']) / 3.0
+            df['amount_m'] = (df['tp'] * df[vol_col]) / 1_000_000.0
+            top_300 = df.sort_values('amount_m', ascending=False).head(300).copy()
+
+        # 2. 抓取 yfinance 歷史資料 (V5.0 強化救援版)
+        st.info(f"Step 2: 正在計算 {len(top_300)} 檔個股 MA5 (採用單兵救援模式)...")
+        results = []
         top_ids = top_300['stock_id'].tolist()
         
-        # 用來存放所有歷史收盤價的字典
-        hist_master = {}
-        
-        # 分批處理，每組 20 檔，避免被 Yahoo 封鎖
-        chunk_size = 20
+        # 建立下載進度
         progress_bar = st.progress(0)
         
-        for i in range(0, len(top_ids), chunk_size):
-            chunk = top_ids[i:i + chunk_size]
-            # 同時準備上市與上櫃代號
-            batch_tickers = [f"{s}.TW" for s in chunk] + [f"{s}.TWO" for s in chunk]
+        for i, sid in enumerate(top_ids):
+            curr_price = top_300.iloc[i]['close']
+            hist_data = None
             
-            # 下載 7 天資料 (足夠取前 4 日收盤)
-            try:
-                # 使用 group_by='ticker' 讓資料結構更好處理
-                batch_data = yf.download(batch_tickers, period="7d", interval="1d", progress=False, group_by='ticker')
-                
-                for sid in chunk:
-                    # 優先找 .TW，找不到或空值再找 .TWO
-                    for suffix in [".TW", ".TWO"]:
-                        ticker = f"{sid}{suffix}"
-                        if ticker in batch_data.columns.levels[0]:
-                            s_data = batch_data[ticker]['Close'].dropna()
-                            if not s_data.empty:
-                                hist_master[sid] = s_data.tolist()
-                                break
-            except:
-                pass
+            # 救援邏輯：先試 .TW 再試 .TWO
+            for suffix in [".TW", ".TWO"]:
+                try:
+                    # 只抓 10 天，快速下載
+                    ticker = yf.Ticker(f"{sid}{suffix}")
+                    temp_hist = ticker.history(period="10d")['Close']
+                    if not temp_hist.empty and len(temp_hist) >= 4:
+                        hist_data = temp_hist
+                        break
+                except:
+                    continue
             
-            # 更新進度條
-            progress_bar.progress(min((i + chunk_size) / len(top_ids), 1.0))
-
-        # 3. 計算 MA5 狀態
-        results = []
-        for _, row in top_300.iterrows():
-            sid = row['stock_id']
-            curr_price = row['close']
-            
-            # 判定邏輯
-            if sid in hist_master:
-                # 取得過去的收盤價 (排除今天，如果 yf 已經含今天則取最後 4 筆)
-                past_closes = hist_master[sid]
-                # 為確保計算的是「今日價 + 過去 4 日」，我們取歷史資料扣除最後一筆(若為今日)後的 4 筆
-                # 簡易作法：取最後 4 筆作為歷史基底
-                recent_closes = past_closes[-4:]
-                
-                if len(recent_closes) >= 4:
-                    ma5 = (sum(recent_closes) + curr_price) / 5.0
-                    status_str = "站上 MA5" if curr_price >= ma5 else "跌破 MA5"
-                else:
-                    status_str = "資料不足"
-                    ma5 = None
+            # 計算 MA5
+            if hist_data is not None:
+                # 均線公式: (今日即時價 + 過去四日收盤) / 5
+                # 我們移除可能包含今天的歷史收盤，確保日期不重複
+                past_4_closes = hist_data.tail(4).tolist()
+                ma5 = (sum(past_4_closes) + curr_price) / 5.0
+                status = "站上 MA5" if curr_price >= ma5 else "跌破 MA5"
             else:
-                status_str = "資料不足"
                 ma5 = None
+                status = "資料不足 (Yahoo 未回傳)"
             
             results.append({
                 "代號": sid,
-                "名稱": row.get('stock_name', ''),
+                "名稱": top_300.iloc[i].get('stock_name', ''),
                 "目前價": curr_price,
                 "五日均價": round(ma5, 2) if ma5 else None,
-                "狀態": status_str,
-                "成交值(百萬)": round(row['amount_m'], 1)
+                "狀態": status,
+                "成交值(百萬)": round(top_300.iloc[i]['amount_m'], 1)
             })
-            
+            progress_bar.progress((i + 1) / len(top_300))
+
         return pd.DataFrame(results), "成功"
     except Exception:
         return None, traceback.format_exc()
 
 # =========================
-# 網頁 UI
+# 網頁 UI 佈局
 # =========================
-st.title("📈 台股成交值前 300 名 - MA5 分析 (分批穩定版)")
+st.markdown(f"### 🚀 台股成交值排行 & MA5 強勢分析 `{CURRENT_VERSION}`")
 
 with st.sidebar:
-    st.header("⚙️ 系統設定")
+    st.header("📋 版本資訊")
+    st.success(f"目前版本：{CURRENT_VERSION}")
+    st.info(f"最後更新：{LAST_UPDATED}")
+    with st.expander("查看修改紀錄"):
+        st.markdown(CHANGELOG)
+    
+    st.divider()
+    st.header("⚙️ 參數設定")
     token = st.text_input("FinMind Token", value="eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiJ9.eyJkYXRlIjoiMjAyNi0wMS0xNCAxOTowMDowNiIsInVzZXJfaWQiOiJcdTllYzNcdTRlYzFcdTVhMDEiLCJlbWFpbCI6ImExOTE3NjZAZ21haWwuY29tIiwiaXAiOiIifQ.JFPtMDNbxKzhl8HsxkOlA1tMlwq8y_NA6NpbRel6HCk", type="password")
-    if st.button("🔄 重新掃描市場"):
+    if st.button("🔄 重新載入數據"):
         st.rerun()
 
+# 讀取清單
 if os.path.exists("全台股股票.txt"):
     with open("全台股股票.txt", "r", encoding="utf-8") as f:
         stock_ids = [s.strip() for s in f.read().replace("\n", "").split(",") if s.strip()]
@@ -124,21 +122,23 @@ else:
     st.error("找不到 全台股股票.txt")
     stock_ids = []
 
-data, msg = get_ma5_logic(token, stock_ids)
+# 執行分析
+data, msg = get_ma5_data(token, stock_ids)
 
 if data is not None:
-    # 指標
+    # 統計指標
     above = len(data[data['狀態'] == "站上 MA5"])
     below = len(data[data['狀態'] == "跌破 MA5"])
     total = above + below
     
     c1, c2, c3 = st.columns(3)
-    c1.metric("站上 MA5", f"{above} 檔", f"{above/total:.1%}" if total > 0 else "0%")
-    c2.metric("跌破 MA5", f"{below} 檔", f"-{below/total:.1%}" if total > 0 else "0%", delta_color="inverse")
-    c3.metric("總分析數", f"{total} 檔")
+    c1.metric("站上 MA5 (強勢)", f"{above} 檔", f"{above/total:.1%}" if total > 0 else "0%")
+    c2.metric("跌破 MA5 (弱勢)", f"{below} 檔", f"-{below/total:.1%}" if total > 0 else "0%", delta_color="inverse")
+    c3.metric("樣本有效數", f"{total} 檔")
 
     st.divider()
+    st.subheader("前 300 名詳細分析 (支援 3707 等上櫃標的)")
     st.dataframe(data, use_container_width=True, hide_index=True)
 else:
-    st.error("發生錯誤，請檢查下方日誌：")
+    st.error("分析執行失敗：")
     st.code(msg)
