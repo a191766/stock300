@@ -36,6 +36,12 @@ def get_snapshot_data(token, stock_list):
         # 篩選並計算成交值
         df = df[df['stock_id'].isin(stock_list)].copy()
         vol_col = 'total_volume' if 'total_volume' in df.columns else 'volume'
+        
+        # 確保必要欄位為數值格式
+        for col in ['close', vol_col, 'change_price']:
+            if col in df.columns:
+                df[col] = pd.to_numeric(df[col], errors='coerce')
+        
         df['amount_m'] = (df['close'] * df[vol_col]) / 1_000_000
         df = df.sort_values('amount_m', ascending=False).head(300)
         return df
@@ -69,8 +75,8 @@ else:
 # 執行分析
 data = get_snapshot_data(fm_token, stock_ids)
 
-if data is not None:
-    # 統計數據
+if data is not None and not data.empty:
+    # 統計數據 (改用 change_price 判斷更精準)
     up = len(data[data['change_price'] > 0])
     down = len(data[data['change_price'] < 0])
     even = len(data[data['change_price'] == 0])
@@ -80,7 +86,7 @@ if data is not None:
     c1, c2, c3, c4 = st.columns(4)
     c1.metric("上漲家數", f"{up} 檔", f"{up/total:.1%}", delta_color="normal")
     c2.metric("下跌家數", f"{down} 檔", f"-{down/total:.1%}", delta_color="inverse")
-    c3.metric("平盤家數", f"{even} 檔", "0%")
+    c3.metric("平盤家數", f"{even} 檔", f"{even/total:.1%}")
     ratio = up/down if down != 0 else 0
     c4.metric("漲跌比 (漲/跌)", f"{ratio:.2f}")
 
@@ -102,8 +108,21 @@ if data is not None:
 
     with right_col:
         st.subheader("成交值 Top 10 明細")
-        display_df = data[['stock_id', 'stock_name', 'close', 'change_rate', 'amount_m']].copy()
-        display_df.columns = ['代號', '名稱', '價格', '漲跌幅%', '成交金額(百萬)']
+        
+        # 解決 KeyError：動態定義想要顯示的欄位
+        cols_map = {
+            'stock_id': '代號',
+            'stock_name': '名稱',
+            'close': '價格',
+            'change_rate': '漲跌幅%',
+            'amount_m': '成交金額(百萬)'
+        }
+        
+        # 備援機制：如果欄位不存在，嘗試從資料中篩選現有的
+        available_cols = [c for c in cols_map.keys() if c in data.columns]
+        display_df = data[available_cols].copy()
+        display_df.rename(columns={c: cols_map[c] for c in available_cols}, inplace=True)
+        
         st.dataframe(display_df.head(10), use_container_width=True)
 
     # 第三列：完整清單
