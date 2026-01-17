@@ -4,5 +4,3 @@ plotly
 FinMind
 requests
 yfinance
-urllib3
-tqdm
