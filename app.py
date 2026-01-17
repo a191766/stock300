@@ -9,55 +9,35 @@ import requests
 # =========================
 # 頁面配置
 # =========================
-st.set_page_config(page_title="台股即時成交值監控 (同步防錯版)", layout="wide")
+st.set_page_config(page_title="台股即時成交值監控 (同步版)", layout="wide")
 
 def get_snapshot_data(token, stock_list):
     try:
         api = DataLoader()
         api.login_by_token(api_token=token)
         df = api.taiwan_stock_tick_snapshot()
-        
-        if df is None or df.empty:
-            st.warning("API 未回傳任何數據。")
-            return None
+        if df is None or df.empty: return None
         
         # 1. 篩選名單
         df = df[df['stock_id'].isin(stock_list)].copy()
         
-        # 2. 自動偵測成交量欄位 (防止 KeyError)
-        # 某些版本叫 total_volume，某些叫 volume
-        vol_col = None
-        for v in ['total_volume', 'volume', 'Vol']:
-            if v in df.columns:
-                vol_col = v
-                break
-        
-        if not vol_col:
-            st.error(f"找不到成交量欄位，現有欄位為: {list(df.columns)}")
-            return None
-
-        # 3. 強制轉為數值格式，避免運算錯誤
-        calc_cols = ['close', 'high', 'low', 'change_price', vol_col]
-        for col in calc_cols:
+        # 2. 轉為數值 (確保計算正確)
+        for col in ['close', 'high', 'low', 'total_volume', 'change_price']:
             if col in df.columns:
                 df[col] = pd.to_numeric(df[col], errors='coerce')
         
-        # 排除數值缺失的資料
-        df = df.dropna(subset=['close', 'high', 'low', vol_col])
-
-        # 4. 同步您的 0+1.py 邏輯：使用 Typical Price (H+L+C)/3
+        # 3. 同步原始程式邏輯：使用 Typical Price (H+L+C)/3
         df['tp'] = (df['high'] + df['low'] + df['close']) / 3.0
         
-        # 5. 計算成交金額 (百萬) -> TP * 成交股數 / 1,000,000
-        df['amount_m'] = (df['tp'] * df[vol_col]) / 1_000_000.0
+        # 4. 計算成交金額 (百萬)
+        df['amount_m'] = (df['tp'] * df['total_volume']) / 1_000_000.0
         
-        # 6. 排序並取前 300 名
+        # 5. 排序並取前 300 名 (這決定了統計的基礎)
         df = df.sort_values('amount_m', ascending=False).head(300)
-        return df, vol_col
+        return df
     except Exception as e:
-        st.error(f"發生錯誤: {e}")
-        st.code(traceback.format_exc())
-        return None, None
+        st.error(f"資料獲取失敗: {e}")
+        return None
 
 # =========================
 # Streamlit 網頁介面
@@ -73,18 +53,16 @@ with st.sidebar:
 # 讀取股票清單
 if os.path.exists("全台股股票.txt"):
     with open("全台股股票.txt", "r", encoding="utf-8") as f:
-        # 確保讀取為字串清單
         stock_ids = [s.strip() for s in f.read().replace("\n", "").split(",") if s.strip()]
+    # 移除指數，只留個股 (同步原始程式邏輯)
+    stock_ids = [s for s in stock_ids if s.isdigit()]
 else:
-    st.error("找不到 全台股股票.txt 檔案！")
     stock_ids = []
 
-result = get_snapshot_data(fm_token, stock_ids)
+data = get_snapshot_data(fm_token, stock_ids)
 
-if result and result[0] is not None:
-    data, v_col = result
-    
-    # 統計漲跌 (使用 change_price 判斷)
+if data is not None and not data.empty:
+    # 統計漲跌
     up = len(data[data['change_price'] > 0])
     down = len(data[data['change_price'] < 0])
     even = len(data[data['change_price'] == 0])
@@ -92,24 +70,20 @@ if result and result[0] is not None:
     
     # 指標顯示
     c1, c2, c3, c4 = st.columns(4)
-    c1.metric("上漲家數", f"{up} 檔", f"{up/total:.1%}" if total > 0 else "0%")
-    c2.metric("下跌家數", f"{down} 檔", f"-{down/total:.1%}" if total > 0 else "0%", delta_color="inverse")
+    c1.metric("上漲家數", f"{up} 檔", f"{up/total:.1%}")
+    c2.metric("下跌家數", f"{down} 檔", f"-{down/total:.1%}", delta_color="inverse")
     c3.metric("平盤家數", f"{even} 檔")
-    ratio = up/down if down != 0 else (up if down == 0 else 0)
+    ratio = up/down if down != 0 else 0
     c4.metric("漲跌比", f"{ratio:.2f}")
 
-    st.divider()
-
-    # 表格顯示 (與您的 CSV 欄位名稱靠攏)
-    st.subheader(f"前 10 名成交值明細 (成交量欄位: {v_col})")
-    res_df = data[['stock_id', 'stock_name', 'close', 'change_price', 'amount_m']].copy()
-    res_df.columns = ['代號', '名稱', '收盤價', '漲跌', '成交值(百萬)']
-    st.table(res_df.head(10))
+    # 表格顯示 (與 CSV 欄位盡量靠攏)
+    st.subheader("前 10 名成交值明細 (與原始程式邏輯同步)")
+    res_df = data[['stock_id', 'stock_name', 'close', 'change_price', 'amount_m']].head(10)
+    res_df.columns = ['代號', '名稱', '收盤', '漲跌', '成交金額(百萬)']
+    st.table(res_df)
 
     # 完整清單
-    with st.expander("展開前 300 名完整分析清單"):
-        st.write(data)
+    with st.expander("展開前 300 名清單"):
+        st.dataframe(data[['stock_id', 'stock_name', 'close', 'high', 'low', 'total_volume', 'amount_m']])
 else:
-    st.info("等待資料載入中... 若長時間沒反應請檢查側邊欄 Token。")
-
-st.sidebar.markdown(f"最後更新：{datetime.now().strftime('%H:%M:%S')}")
+    st.info("無法讀取資料，請檢查 Token 或檔案。")
